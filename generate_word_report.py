@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import io
 from pathlib import Path
+import re
+from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional
 
 from docx import Document
@@ -26,16 +28,53 @@ from PIL import Image
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 
 
-def find_images(folder: Path) -> List[Path]:
-    images: List[Path] = []
-    for path in sorted(folder.iterdir()):
+@dataclass
+class ImageItem:
+    path: Path
+    mileage_text: str
+    mileage_value: float
+    y_value: int
+
+
+def parse_mileage(text: str) -> float:
+    digits = re.findall(r"[0-9]+(?:\.[0-9]+)?", text)
+    if not digits:
+        return float("inf")
+    try:
+        return float(digits[0])
+    except ValueError:
+        return float("inf")
+
+
+def find_images(folder: Path) -> List[ImageItem]:
+    items: List[ImageItem] = []
+    for path in folder.iterdir():
         if path.is_file() and path.suffix.lower() in IMAGE_EXTS:
-            images.append(path)
-    return images
+            stem = path.stem
+            if "-" in stem:
+                parts = stem.split("-", 1)
+                mileage_text = parts[0].strip()
+                try:
+                    y_value = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    y_value = 0
+            else:
+                mileage_text = stem.strip()
+                y_value = 0
+            items.append(
+                ImageItem(
+                    path=path,
+                    mileage_text=mileage_text,
+                    mileage_value=parse_mileage(mileage_text),
+                    y_value=y_value,
+                )
+            )
+    items.sort(key=lambda item: (item.mileage_value, item.y_value, item.mileage_text))
+    return items
 
 
-def chunked(items: Iterable[Path], size: int) -> Iterable[List[Path]]:
-    row: List[Path] = []
+def chunked(items: Iterable[ImageItem], size: int) -> Iterable[List[ImageItem]]:
+    row: List[ImageItem] = []
     for item in items:
         row.append(item)
         if len(row) == size:
@@ -112,7 +151,7 @@ def add_image_block(cell, image_stream: io.BytesIO, width_cm: float, height_cm: 
 
 
 def build_document(
-    images: List[Path],
+    images: List[ImageItem],
     per_row: int,
     width_cm: float,
     height_cm: float,
@@ -148,10 +187,12 @@ def build_document(
 
         for col_idx, cell_idx in enumerate((0, 2)):
             if col_idx < len(row_images):
-                image_path = row_images[col_idx]
+                image_item = row_images[col_idx]
                 s_cycle = (image_index - 1) % 3 + 1
-                label = f"图5.6-{image_index} S{s_cycle}沉降曲线"
-                stream = prepare_image_stream(image_path, width_cm, height_cm)
+                label = (
+                    f"图5.6-{image_index} {image_item.mileage_text}S{s_cycle}沉降曲线"
+                )
+                stream = prepare_image_stream(image_item.path, width_cm, height_cm)
                 image_streams.append(stream)
                 add_image_block(img_row.cells[cell_idx], stream, width_cm, height_cm)
                 processed += 1
