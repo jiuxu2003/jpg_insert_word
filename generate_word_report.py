@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import io
 from pathlib import Path
-from typing import Iterable, List
+from typing import Callable, Iterable, List, Optional
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -78,27 +78,25 @@ def set_cell_margins(cell, *, top=0.0, start=0.0, bottom=0.0, end=0.0):
 
 
 def prepare_image_stream(image_path: Path, width_cm: float, height_cm: float) -> io.BytesIO:
-    target_ratio = width_cm / height_cm
+    dpi = 220
+    target_w = int(round(width_cm / 2.54 * dpi))
+    target_h = int(round(height_cm / 2.54 * dpi))
+
     with Image.open(image_path) as img:
         img = img.convert("RGB")
-        img_ratio = img.width / img.height
-        if abs(img_ratio - target_ratio) > 1e-3:
-            if img_ratio > target_ratio:
-                new_width = int(round(target_ratio * img.height))
-                left = (img.width - new_width) // 2
-                img = img.crop((left, 0, left + new_width, img.height))
-            else:
-                new_height = int(round(img.width / target_ratio))
-                top = (img.height - new_height) // 2
-                img = img.crop((0, top, img.width, top + new_height))
+        scale = min(target_w / img.width, target_h / img.height, 1.0)
+        new_size = (
+            max(1, int(round(img.width * scale))),
+            max(1, int(round(img.height * scale))),
+        )
+        resized = img.resize(new_size, Image.LANCZOS)
 
-        dpi = 150
-        width_px = int(round(width_cm / 2.54 * dpi))
-        height_px = int(round(height_cm / 2.54 * dpi))
-        resized = img.resize((width_px, height_px), Image.LANCZOS)
+        canvas = Image.new("RGB", (target_w, target_h), color="white")
+        offset = ((target_w - new_size[0]) // 2, (target_h - new_size[1]) // 2)
+        canvas.paste(resized, offset)
 
         stream = io.BytesIO()
-        resized.save(stream, format="PNG", dpi=(dpi, dpi))
+        canvas.save(stream, format="PNG", dpi=(dpi, dpi))
         stream.seek(0)
         return stream
 
@@ -114,7 +112,11 @@ def add_image_block(cell, image_stream: io.BytesIO, width_cm: float, height_cm: 
 
 
 def build_document(
-    images: List[Path], per_row: int, width_cm: float, height_cm: float
+    images: List[Path],
+    per_row: int,
+    width_cm: float,
+    height_cm: float,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Document:
     document = Document()
     section = document.sections[0]
@@ -137,6 +139,8 @@ def build_document(
         return row
 
     image_index = 1
+    processed = 0
+    total = len(images)
     image_streams: List[io.BytesIO] = []
     for row_images in chunked(images, per_row):
         img_row = add_row()
@@ -150,6 +154,10 @@ def build_document(
                 stream = prepare_image_stream(image_path, width_cm, height_cm)
                 image_streams.append(stream)
                 add_image_block(img_row.cells[cell_idx], stream, width_cm, height_cm)
+                processed += 1
+                if progress_callback:
+                    progress_callback(processed, total)
+
                 caption_cell = cap_row.cells[cell_idx]
                 caption_cell.text = ""
                 caption_para = caption_cell.paragraphs[0]
@@ -187,6 +195,7 @@ def generate_word_report(
     per_row: int = 2,
     width_cm: float = 7.6,
     height_cm: float = 4.7,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     if not image_dir.is_dir():
         raise FileNotFoundError(f"Image directory not found: {image_dir}")
@@ -195,7 +204,9 @@ def generate_word_report(
     if not images:
         raise ValueError("No supported image files were found in the folder.")
 
-    document = build_document(images, per_row, width_cm, height_cm)
+    document = build_document(
+        images, per_row, width_cm, height_cm, progress_callback=progress_callback
+    )
     document.save(str(output_path))
 
 
@@ -221,13 +232,34 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    progress_cb: Optional[Callable[[int, int], None]] = None
+
+    try:
+        import sys
+
+        if sys.stdout.isatty():
+            def cli_progress(done: int, total: int) -> None:
+                percent = done / total * 100 if total else 0
+                print(f"\r正在处理图片：{done}/{total} ({percent:5.1f}%)", end="", flush=True)
+
+            progress_cb = cli_progress
+    except Exception:  # noqa: BLE001
+        progress_cb = None
+
     try:
         generate_word_report(
-            args.images, args.output, args.per_row, args.width_cm, args.height_cm
+            args.images,
+            args.output,
+            args.per_row,
+            args.width_cm,
+            args.height_cm,
+            progress_callback=progress_cb,
         )
     except Exception as exc:
         raise SystemExit(str(exc))
     else:
+        if progress_cb is not None:
+            print()
         print("Saved images to", args.output)
 
 
