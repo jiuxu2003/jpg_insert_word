@@ -1,0 +1,236 @@
+"""
+Generate a Word document that lays out images in two columns with numbered captions.
+
+Usage:
+    python generate_word_report.py --images ./pics --output report.docx --per-row 2
+
+The caption text defaults to "图{idx} {stem}", where stem is taken from each image's file name.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+from pathlib import Path
+from typing import Iterable, List
+
+from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
+from PIL import Image
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+
+
+def find_images(folder: Path) -> List[Path]:
+    images: List[Path] = []
+    for path in sorted(folder.iterdir()):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTS:
+            images.append(path)
+    return images
+
+
+def chunked(items: Iterable[Path], size: int) -> Iterable[List[Path]]:
+    row: List[Path] = []
+    for item in items:
+        row.append(item)
+        if len(row) == size:
+            yield row
+            row = []
+    if row:
+        yield row
+
+
+def add_caption_run(run, label: str) -> None:
+    run.text = label
+    font = run.font
+    font.size = Pt(10.5)
+    font.name = "Times New Roman"
+    r_fonts = run._element.rPr.rFonts
+    r_fonts.set(qn("w:ascii"), "Times New Roman")
+    r_fonts.set(qn("w:hAnsi"), "Times New Roman")
+    r_fonts.set(qn("w:eastAsia"), "宋体")
+
+
+def _cm_to_twips(value: float) -> int:
+    return int(round(value * 567))
+
+
+def set_cell_margins(cell, *, top=0.0, start=0.0, bottom=0.0, end=0.0):
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcMar = tcPr.find(qn("w:tcMar"))
+    if tcMar is None:
+        tcMar = OxmlElement("w:tcMar")
+        tcPr.append(tcMar)
+
+    for attr, value in {"top": top, "start": start, "bottom": bottom, "end": end}.items():
+        element = tcMar.find(qn(f"w:{attr}"))
+        if element is None:
+            element = OxmlElement(f"w:{attr}")
+            tcMar.append(element)
+        element.set(qn("w:type"), "dxa")
+        element.set(qn("w:w"), str(_cm_to_twips(value)))
+
+
+def prepare_image_stream(image_path: Path, width_cm: float, height_cm: float) -> io.BytesIO:
+    target_ratio = width_cm / height_cm
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        img_ratio = img.width / img.height
+        if abs(img_ratio - target_ratio) > 1e-3:
+            if img_ratio > target_ratio:
+                new_width = int(round(target_ratio * img.height))
+                left = (img.width - new_width) // 2
+                img = img.crop((left, 0, left + new_width, img.height))
+            else:
+                new_height = int(round(img.width / target_ratio))
+                top = (img.height - new_height) // 2
+                img = img.crop((0, top, img.width, top + new_height))
+
+        dpi = 150
+        width_px = int(round(width_cm / 2.54 * dpi))
+        height_px = int(round(height_cm / 2.54 * dpi))
+        resized = img.resize((width_px, height_px), Image.LANCZOS)
+
+        stream = io.BytesIO()
+        resized.save(stream, format="PNG", dpi=(dpi, dpi))
+        stream.seek(0)
+        return stream
+
+
+def add_image_block(cell, image_stream: io.BytesIO, width_cm: float, height_cm: float) -> None:
+    cell.text = ""
+    pic_para = cell.paragraphs[0]
+    pic_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    pic_para.paragraph_format.space_before = Pt(0)
+    pic_para.paragraph_format.space_after = Pt(2)
+    run = pic_para.add_run()
+    run.add_picture(image_stream, width=Cm(width_cm), height=Cm(height_cm))
+
+
+def build_document(
+    images: List[Path], per_row: int, width_cm: float, height_cm: float
+) -> Document:
+    document = Document()
+    section = document.sections[0]
+    section.left_margin = Cm(2.76)
+    section.right_margin = Cm(2.76)
+
+    table = document.add_table(rows=0, cols=3)
+    table.autofit = False
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+
+    gap_width = max(0.1, 11.70 - 2.76 - width_cm)
+    column_widths = [width_cm, gap_width, width_cm]
+
+    def add_row():
+        row = table.add_row()
+        for idx, width in enumerate(column_widths):
+            cell = row.cells[idx]
+            cell.width = Cm(width)
+            set_cell_margins(cell, top=0, start=0, bottom=0, end=0)
+        return row
+
+    image_index = 1
+    image_streams: List[io.BytesIO] = []
+    for row_images in chunked(images, per_row):
+        img_row = add_row()
+        cap_row = add_row()
+
+        for col_idx, cell_idx in enumerate((0, 2)):
+            if col_idx < len(row_images):
+                image_path = row_images[col_idx]
+                s_cycle = (image_index - 1) % 3 + 1
+                label = f"图5.6-{image_index} S{s_cycle}沉降曲线"
+                stream = prepare_image_stream(image_path, width_cm, height_cm)
+                image_streams.append(stream)
+                add_image_block(img_row.cells[cell_idx], stream, width_cm, height_cm)
+                caption_cell = cap_row.cells[cell_idx]
+                caption_cell.text = ""
+                caption_para = caption_cell.paragraphs[0]
+                caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                caption_para.paragraph_format.space_before = Pt(0)
+                caption_para.paragraph_format.space_after = Pt(0)
+                add_caption_run(caption_para.add_run(), label)
+                image_index += 1
+            else:
+                img_row.cells[cell_idx].text = ""
+                cap_row.cells[cell_idx].text = ""
+
+        img_row.cells[1].text = ""
+        cap_row.cells[1].text = ""
+
+    # Remove table borders
+    tbl_pr = table._tbl.tblPr
+    tbl_borders = tbl_pr.find(qn("w:tblBorders"))
+    if tbl_borders is None:
+        tbl_borders = OxmlElement("w:tblBorders")
+        tbl_pr.append(tbl_borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        element = tbl_borders.find(qn(f"w:{edge}"))
+        if element is None:
+            element = OxmlElement(f"w:{edge}")
+            tbl_borders.append(element)
+        element.set(qn("w:val"), "nil")
+
+    return document
+
+
+def generate_word_report(
+    image_dir: Path,
+    output_path: Path,
+    per_row: int = 2,
+    width_cm: float = 7.6,
+    height_cm: float = 4.7,
+) -> None:
+    if not image_dir.is_dir():
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+
+    images = find_images(image_dir)
+    if not images:
+        raise ValueError("No supported image files were found in the folder.")
+
+    document = build_document(images, per_row, width_cm, height_cm)
+    document.save(str(output_path))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate a Word doc from images.")
+    parser.add_argument("--images", required=True, type=Path, help="Folder with images")
+    parser.add_argument(
+        "--output",
+        default="图片汇总.docx",
+        type=Path,
+        help="Output Word file name",
+    )
+    parser.add_argument(
+        "--per-row",
+        type=int,
+        default=2,
+        help="How many images to place per row",
+    )
+    parser.add_argument("--width-cm", type=float, default=7.6, help="Image width in cm")
+    parser.add_argument("--height-cm", type=float, default=4.7, help="Image height in cm")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        generate_word_report(
+            args.images, args.output, args.per_row, args.width_cm, args.height_cm
+        )
+    except Exception as exc:
+        raise SystemExit(str(exc))
+    else:
+        print("Saved images to", args.output)
+
+
+if __name__ == "__main__":
+    main()
+
